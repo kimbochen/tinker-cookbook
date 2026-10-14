@@ -1,0 +1,22 @@
+{
+  "caesar_cipher-train.jsonl": {
+    "bytes": 11291100,
+    "rows": 7788,
+    "sha256": "41beb35347fd0774d702464466e3467b243535b594658161f2adaa2a7e4758c2"
+  },
+  "caesar_cipher-dev.jsonl": {
+    "bytes": 183027,
+    "rows": 126,
+    "sha256": "c2f97f3f252640c9652faebac523b1f5669bd952ffb92f6890a74e5765297d41"
+  },
+  "simple_geometry-train.jsonl": {
+    "bytes": 11946723,
+    "rows": 7788,
+    "sha256": "bb7fcfbda69a3b6ac7db9c5c545e0e84fa78d8eeb432d37608573b5464c8a02f"
+  },
+  "simple_geometry-dev.jsonl": {
+    "bytes": 195111,
+    "rows": 128,
+    "sha256": "8dc5fc2aa9c3355d8ee3d4b521a997c7863f471723663a9889e9e4db5c5e6b8d"
+  }
+}

@@ -36,6 +36,9 @@ Repository = "https://github.com/thinking-machines-lab/tinker-cookbook"
 Documentation = "https://tinker-docs.thinkingmachines.ai/"
 
 [project.optional-dependencies]
+qwen36-puzzles = [
+    "reasoning-gym==0.1.25",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

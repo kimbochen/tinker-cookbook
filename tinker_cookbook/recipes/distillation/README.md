@@ -161,3 +161,69 @@ python -m tinker_cookbook.recipes.distillation.on_policy_multi_teacher \
     lora_rank=128 \
     wandb_project=cookbook_distillation
 ```
+
+## Qwen3.6 with two domain teachers
+
+`on_policy_multi_teacher_qwen36.py` reproduces a small routed distillation setup
+for `Qwen/Qwen3.6-35B-A3B`. It uses the standard `PromptOnlyDataset` and
+`train_on_policy` loop: Caesar prompts are scored by the Caesar teacher, and
+geometry prompts by the geometry teacher. Puzzle scores are evaluation metrics;
+the training signal is the teacher's token log probabilities.
+
+```bash
+pip install -e '.[qwen36-puzzles]'
+python -m tinker_cookbook.recipes.distillation.on_policy_multi_teacher_qwen36 dry_run=True
+# Set TINKER_API_KEY before training:
+python -m tinker_cookbook.recipes.distillation.on_policy_multi_teacher_qwen36
+```
+
+The default checkpoints require access to their owning Tinker project. Override
+`caesar_teacher=tinker://.../sampler_weights/...` and
+`geometry_teacher=tinker://.../sampler_weights/...` to use your own compatible
+Qwen3.6 teachers.
+
+Defaults match the original experiment:
+
+| Setting | Value |
+| --- | --- |
+| Training updates | 20 |
+| Prompts per update | 128 (64 per domain) |
+| Responses per prompt (group size) | 1 |
+| LoRA rank / learning rate | 64 / 1e-5 |
+| Loss / substeps | Importance sampling / 1 |
+| KL coefficient / discount | 1.0 / 0.0 |
+| Generation temperature / response limit | 1.0 / 30,720 tokens |
+| Prompt + response context budget | 32,768 tokens |
+| Prompt shuffle seed | 20260921 |
+| Checkpoint interval | 10 updates, plus final |
+
+Each teacher is evaluated once on its own dev split before training. The student
+is evaluated on both domains before updates and after updates 7, 14, and 20.
+Evaluation uses three independent responses per prompt (avg@3), temperature 1,
+top-p 1, top-k -1, and the same response limit as training. Sampling is unseeded;
+the shuffle seed only controls training prompt order. `eval_every=0` disables all
+evaluations. For other positive intervals, student evaluation runs at update 0,
+at interval multiples below `max_steps`, and once on the final checkpoint.
+
+The cookbook loop does not evaluate its final checkpoint, so the recipe performs
+that evaluation after training returns. Teacher and final-evaluation clients own
+and close their own sessions. Results are appended to `evaluations.jsonl` with
+explicit teacher/student roles and completed-update counts; intermediate metrics
+also go through the cookbook evaluator hook. No custom rollout recorder or trace
+analysis is included.
+
+Outputs default to a timestamped directory under
+`$TINKER_COOKBOOK_RUNS_DIR/distillation` (or `~/tinker-runs/distillation`). Use a
+fresh `log_path` for every run; this recipe intentionally does not resume, so
+teacher baselines and evaluation scheduling remain unambiguous. Dry runs validate
+all selected prompts, the pinned tokenizer's thinking template, and context
+limits without creating a Tinker session.
+
+The four compressed splits in `qwen36_puzzles/data/` are copied unchanged from
+[opd-benchmark at 383c8f4](https://github.com/SemiAnalysisAI/opd-benchmark/tree/383c8f49a6f4b350ae2ddf3d4b7e0e92d917c2c3/data).
+Each domain has 7,788 training prompts; Caesar has 126 dev prompts and geometry
+has 128. The manifest records uncompressed sizes, row counts, and SHA-256 hashes,
+which the loader verifies. Scoring follows the benchmark's reasoning-gym 0.1.25
+rule: use the answer after the final `</think>` and award 1 only for a fully
+correct answer. The tokenizer is pinned to revision
+`995ad96eacd98c81ed38be0c5b274b04031597b0`. No sibling benchmark checkout is needed.
