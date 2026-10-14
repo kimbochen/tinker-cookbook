@@ -9,7 +9,7 @@ import asyncio
 import logging
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     from tinker_cookbook.stores.training_store import TrainingRunStore
@@ -381,133 +381,152 @@ async def main(
         config=config,
         wandb_name=config.wandb_name,
     )
-    if config.enable_trace:
-        # Get and rename the current (main) task
-        current_task = asyncio.current_task()
-        if current_task is not None:
-            current_task.set_name("main")
-        trace_events_path = str(Path(config.log_path) / "trace_events.jsonl")
-        logger.info(f"Tracing is enabled. Trace events will be saved to {trace_events_path}")
-        logger.info(
-            f"Run `python tinker_cookbook/utils/trace.py {trace_events_path} trace.json` and visualize in chrome://tracing or https://ui.perfetto.dev/"
-        )
-        trace.trace_init(output_file=trace_events_path)
-
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("pylatexenc").setLevel(logging.WARNING)
-
-    resume_info = checkpoint_utils.get_last_checkpoint(config.log_path)
-    if resume_info:
-        start_batch = resume_info.batch
-    else:
-        start_batch = 0
-
-    service_client = tinker.ServiceClient(
-        base_url=config.base_url,
-        user_metadata=recipe_user_metadata(config.recipe_name),
-    )
-    user_metadata: dict[str, str] = {}
-    if wandb_link := ml_logger.get_logger_url():
-        user_metadata["wandb_link"] = wandb_link
-    checkpoint_utils.add_renderer_name_to_user_metadata(user_metadata, config.renderer_name)
-    model_info.warn_if_renderer_not_recommended(config.model_name, config.renderer_name)
-
-    if resume_info:
-        # Resuming interrupted training - load optimizer state for proper continuation
-        await checkpoint_utils.check_renderer_name_for_checkpoint_async(
-            service_client, resume_info.state_path, config.renderer_name
-        )
-        training_client = (
-            await service_client.create_training_client_from_state_with_optimizer_async(
-                resume_info.state_path, user_metadata=user_metadata
+    service_client: tinker.ServiceClient | None = None
+    status: Literal["success", "errored", "interrupted"] = "errored"
+    try:
+        if config.enable_trace:
+            # Get and rename the current (main) task
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.set_name("main")
+            trace_events_path = str(Path(config.log_path) / "trace_events.jsonl")
+            logger.info(f"Tracing is enabled. Trace events will be saved to {trace_events_path}")
+            logger.info(
+                f"Run `python tinker_cookbook/utils/trace.py {trace_events_path} trace.json` and visualize in chrome://tracing or https://ui.perfetto.dev/"
             )
+            trace.trace_init(output_file=trace_events_path)
+
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("pylatexenc").setLevel(logging.WARNING)
+
+        resume_info = checkpoint_utils.get_last_checkpoint(config.log_path)
+        if resume_info:
+            start_batch = resume_info.batch
+        else:
+            start_batch = 0
+
+        service_client = tinker.ServiceClient(
+            base_url=config.base_url,
+            user_metadata=recipe_user_metadata(config.recipe_name),
         )
-        logger.info(f"Resumed training from {resume_info.state_path}")
-    elif config.load_checkpoint_path:
-        # Starting fresh from a checkpoint - load weights only (fresh optimizer)
-        await checkpoint_utils.check_renderer_name_for_checkpoint_async(
-            service_client, config.load_checkpoint_path, config.renderer_name
-        )
-        training_client = await service_client.create_training_client_from_state_async(
-            config.load_checkpoint_path, user_metadata=user_metadata
-        )
-        logger.info(f"Loaded weights from {config.load_checkpoint_path}")
-    else:
-        training_client = await service_client.create_lora_training_client_async(
-            config.model_name, rank=config.lora_rank, user_metadata=user_metadata
-        )
+        user_metadata: dict[str, str] = {}
+        if wandb_link := ml_logger.get_logger_url():
+            user_metadata["wandb_link"] = wandb_link
+        checkpoint_utils.add_renderer_name_to_user_metadata(user_metadata, config.renderer_name)
+        model_info.warn_if_renderer_not_recommended(config.model_name, config.renderer_name)
 
-    tokenizer = get_tokenizer(config.model_name)
+        if resume_info:
+            # Resuming interrupted training - load optimizer state for proper continuation
+            await checkpoint_utils.check_renderer_name_for_checkpoint_async(
+                service_client, resume_info.state_path, config.renderer_name
+            )
+            training_client = (
+                await service_client.create_training_client_from_state_with_optimizer_async(
+                    resume_info.state_path, user_metadata=user_metadata
+                )
+            )
+            logger.info(f"Resumed training from {resume_info.state_path}")
+        elif config.load_checkpoint_path:
+            # Starting fresh from a checkpoint - load weights only (fresh optimizer)
+            await checkpoint_utils.check_renderer_name_for_checkpoint_async(
+                service_client, config.load_checkpoint_path, config.renderer_name
+            )
+            training_client = await service_client.create_training_client_from_state_async(
+                config.load_checkpoint_path, user_metadata=user_metadata
+            )
+            logger.info(f"Loaded weights from {config.load_checkpoint_path}")
+        else:
+            training_client = await service_client.create_lora_training_client_async(
+                config.model_name, rank=config.lora_rank, user_metadata=user_metadata
+            )
 
-    # Create datasets and teacher sampling clients from configs
-    datasets = []
-    teacher_clients = []
-    groups_per_batch_list = []
-    evaluators = [evaluator() for evaluator in config.evaluator_builders]
+        tokenizer = get_tokenizer(config.model_name)
 
-    for dataset_config in config.dataset_configs:
-        # Create dataset
-        dataset, maybe_test_dataset = await dataset_config.dataset_builder()
-        datasets.append(dataset)
-        groups_per_batch_list.append(dataset_config.groups_per_batch)
+        # Create datasets and teacher sampling clients from configs
+        datasets = []
+        teacher_clients = []
+        groups_per_batch_list = []
+        evaluators = [evaluator() for evaluator in config.evaluator_builders]
 
-        # Add test dataset evaluator if present
-        if maybe_test_dataset is not None:
-            evaluators.append(RLTestSetEvaluator(maybe_test_dataset, max_tokens=config.max_tokens))
+        for dataset_config in config.dataset_configs:
+            # Create dataset
+            dataset, maybe_test_dataset = await dataset_config.dataset_builder()
+            datasets.append(dataset)
+            groups_per_batch_list.append(dataset_config.groups_per_batch)
 
-        # Create teacher sampling client
-        teacher_config = dataset_config.teacher_config
-        teacher_client = service_client.create_sampling_client(base_model=teacher_config.base_model)
-        # Load teacher checkpoint if specified
-        if teacher_config.load_checkpoint_path is not None:
+            # Add test dataset evaluator if present
+            if maybe_test_dataset is not None:
+                evaluators.append(
+                    RLTestSetEvaluator(maybe_test_dataset, max_tokens=config.max_tokens)
+                )
+
+            # Create teacher sampling client
+            teacher_config = dataset_config.teacher_config
             teacher_client = service_client.create_sampling_client(
-                base_model=teacher_config.base_model,
-                model_path=teacher_config.load_checkpoint_path,
+                base_model=teacher_config.base_model
             )
-        teacher_clients.append(teacher_client)
-        logger.info(
-            f"Created teacher sampling client for {teacher_config.base_model} "
-            f"(checkpoint: {teacher_config.load_checkpoint_path})"
+            # Load teacher checkpoint if specified
+            if teacher_config.load_checkpoint_path is not None:
+                teacher_client = service_client.create_sampling_client(
+                    base_model=teacher_config.base_model,
+                    model_path=teacher_config.load_checkpoint_path,
+                )
+            teacher_clients.append(teacher_client)
+            logger.info(
+                f"Created teacher sampling client for {teacher_config.base_model} "
+                f"(checkpoint: {teacher_config.load_checkpoint_path})"
+            )
+
+        # Wrap datasets in CompositeDataset
+        composite_dataset = CompositeDataset(datasets, groups_per_batch_list)
+        num_batches = len(composite_dataset)
+        num_batches = (
+            min(config.max_steps, num_batches) if config.max_steps is not None else num_batches
+        )
+        logger.info(f"Will train on {num_batches} batches (dataset has {num_batches})")
+
+        checkpoint_mgr = checkpoint_utils.CheckpointManager(
+            training_client=training_client,
+            service_client=service_client,
+            log_path=config.log_path,
+            save_every=config.save_every,
+            store=ml_logger.store,
         )
 
-    # Wrap datasets in CompositeDataset
-    composite_dataset = CompositeDataset(datasets, groups_per_batch_list)
-    num_batches = len(composite_dataset)
-    num_batches = (
-        min(config.max_steps, num_batches) if config.max_steps is not None else num_batches
-    )
-    logger.info(f"Will train on {num_batches} batches (dataset has {num_batches})")
+        # Training loop
+        await do_sync_training(
+            start_batch=start_batch,
+            end_batch=num_batches,
+            num_batches=num_batches,
+            config=config,
+            training_client=training_client,
+            checkpoint_mgr=checkpoint_mgr,
+            service_client=service_client,
+            evaluators=evaluators,
+            dataset=composite_dataset,
+            teacher_clients=teacher_clients,
+            ml_logger=ml_logger,
+            tokenizer=tokenizer,
+        )
 
-    checkpoint_mgr = checkpoint_utils.CheckpointManager(
-        training_client=training_client,
-        service_client=service_client,
-        log_path=config.log_path,
-        save_every=config.save_every,
-        store=ml_logger.store,
-    )
-
-    # Training loop
-    await do_sync_training(
-        start_batch=start_batch,
-        end_batch=num_batches,
-        num_batches=num_batches,
-        config=config,
-        training_client=training_client,
-        checkpoint_mgr=checkpoint_mgr,
-        service_client=service_client,
-        evaluators=evaluators,
-        dataset=composite_dataset,
-        teacher_clients=teacher_clients,
-        ml_logger=ml_logger,
-        tokenizer=tokenizer,
-    )
-
-    # Save final checkpoint
-    if start_batch < num_batches:
-        await checkpoint_mgr.save_final_async(loop_state={"batch": num_batches})
-    else:
-        logger.info("Training was already complete; nothing to do")
-
-    # Cleanup
-    ml_logger.close()
+        # Save final checkpoint
+        if start_batch < num_batches:
+            await checkpoint_mgr.save_final_async(loop_state={"batch": num_batches})
+        else:
+            logger.info("Training was already complete; nothing to do")
+        status = "success"
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        status = "interrupted"
+        raise
+    finally:
+        try:
+            if service_client is not None:
+                try:
+                    await service_client.close(status)
+                except Exception:
+                    if status == "success":
+                        raise
+                    logger.exception("Failed to close session; preserving original training error")
+        finally:
+            ml_logger.close()
     logger.info("Training completed successfully")
